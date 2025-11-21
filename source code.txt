@@ -1,0 +1,672 @@
+# csv_flask.py
+"""
+CSV Upload -> Full CSV Summary Flask app
+
+Usage:
+    python csv_flask.py
+
+Upload via browser at http://127.0.0.1:5000/ or:
+    curl -o output.csv -F "file=@sample.csv" "http://127.0.0.1:5000/upload?format=csv"
+"""
+from flask import Flask, request, Response, render_template_string, jsonify, send_file
+import pandas as pd
+import io
+import csv
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # safe backend for servers
+import matplotlib.pyplot as plt
+import zipfile
+import tempfile
+import os
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
+
+UPLOAD_FORM = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Upload CSV</title>
+  <style>
+    :root{
+      --bg:#f6f8fb;
+      --card:#ffffff;
+      --accent:#5b8def;
+      --muted:#6b7280;
+      --success:#16a34a;
+      --danger:#ef4444;
+      --shadow: 0 8px 24px rgba(23,31,58,0.06);
+      --radius:14px;
+      font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }
+    html,body{
+      height:100%;
+      margin:0;
+      background: linear-gradient(180deg, var(--bg) 0%, #ffffff 100%);
+      color:#111827;
+    }
+    .container{
+      max-width:960px;
+      margin:48px auto;
+      padding:24px;
+    }
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      box-shadow:var(--shadow);
+      padding:28px;
+      display:flex;
+      flex-direction:column;
+      gap:18px;
+    }
+    h1{
+      margin:0;
+      font-size:22px;
+      letter-spacing: -0.2px;
+    }
+    p.lead{
+      margin:0;
+      color:var(--muted);
+      font-size:14px;
+    }
+    form{
+      display:flex;
+      gap:12px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    input[type=file]{
+      padding:8px 10px;
+      border-radius:10px;
+      border:1px solid #e6e9ef;
+      background:linear-gradient(180deg,#fff,#fbfdff);
+      font-size:14px;
+    }
+    input[type=submit]{
+      background:var(--accent);
+      color:white;
+      border:none;
+      padding:10px 16px;
+      border-radius:10px;
+      cursor:pointer;
+      font-weight:600;
+      box-shadow: 0 6px 18px rgba(91,141,239,0.24);
+    }
+    input[type=submit]:hover{ transform: translateY(-1px); }
+    .hint{
+      font-size:13px;
+      color:var(--muted);
+      margin-top:8px;
+    }
+    footer.small{
+      margin-top:12px;
+      font-size:12px;
+      color:var(--muted);
+    }
+
+    /* small screen tweaks */
+    @media (max-width:560px){
+      .container{ margin:20px; padding:12px; }
+      .card{ padding:16px; }
+      form{ flex-direction:column; align-items:stretch; }
+      input[type=file]{ width:100%; }
+      input[type=submit]{ width:100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h1>Upload CSV to get full summary</h1>
+      <p class="lead">Drop a CSV file and get a complete human-friendly summary — statistics, missing values, sample rows and downloadable summaries.</p>
+      <form method=post enctype=multipart/form-data action="/upload">
+        <input type=file name=file accept=".csv" required>
+        <input type=submit value="Upload & View Summary">
+      </form>
+      <p class="hint">Or use curl to download CSV summary: <code>curl -o summary.csv -F "file=@sample.csv" "http://127.0.0.1:5000/upload?format=csv"</code></p>
+      <footer class="small">Max upload size: 16 MB</footer>
+    </div>
+  </div>
+</body>
+</html>
+"""
+
+HTML_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CSV Summary Report</title>
+  <style>
+    :root{
+      --bg:#f4f7fb;
+      --card:#ffffff;
+      --accent:#3b82f6;
+      --muted:#6b7280;
+      --success:#10b981;
+      --danger:#ef4444;
+      --shadow: 0 8px 30px rgba(19,24,44,0.06);
+      --radius:12px;
+      --table-border:#e6eef9;
+      font-family:Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+    }
+    html,body{ margin:0; background:var(--bg); color:#0f172a; }
+    .page{
+      max-width:1100px;
+      margin:28px auto;
+      padding:20px;
+    }
+    .header{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:16px;
+      margin-bottom:18px;
+    }
+    .brand{
+      display:flex;
+      gap:12px;
+      align-items:center;
+    }
+    .logo{
+      width:46px; height:46px; border-radius:10px;
+      background:linear-gradient(135deg, var(--accent), #60a5fa);
+      box-shadow:0 8px 24px rgba(59,130,246,0.18);
+      display:flex; align-items:center; justify-content:center; color:white; font-weight:700;
+      font-size:18px;
+    }
+    .title{
+      line-height:1;
+    }
+    .title h1{ margin:0; font-size:20px; }
+    .title p{ margin:0; color:var(--muted); font-size:13px; }
+
+    .actions{
+      display:flex;
+      gap:10px;
+      align-items:center;
+    }
+    .actions a{
+      text-decoration:none;
+      padding:8px 12px;
+      border-radius:10px;
+      background:linear-gradient(180deg,#fff,#f6fbff);
+      border:1px solid #e4eefb;
+      color:#0f172a;
+      font-weight:600;
+      box-shadow: 0 6px 14px rgba(12,34,78,0.04);
+    }
+    .actions a.primary{
+      background:var(--accent);
+      color:white;
+      border:none;
+      box-shadow: 0 8px 24px rgba(59,130,246,0.18);
+    }
+    .card{
+      background:var(--card);
+      border-radius:var(--radius);
+      padding:18px;
+      box-shadow:var(--shadow);
+      margin-bottom:16px;
+    }
+
+    /* tables */
+    table{ width:100%; border-collapse:collapse; font-size:13px; }
+    thead th{
+      text-align:left;
+      padding:10px 12px;
+      border-bottom:2px solid var(--table-border);
+      background:linear-gradient(180deg,#fbfdff,#f6fbff);
+      font-weight:700;
+    }
+    tbody td{
+      padding:10px 12px;
+      border-bottom:1px solid #f1f6fb;
+      color:#0b1220;
+    }
+    .table-sm thead th{ padding:8px 10px; }
+    .table-sm tbody td{ padding:8px 10px; }
+
+    .muted { color:var(--muted); font-size:13px; }
+
+    /* small stat chips */
+    .stats{
+      display:flex; gap:14px; flex-wrap:wrap;
+    }
+    .stat{
+      background:linear-gradient(180deg,#ffffff,#fbfdff);
+      padding:14px;
+      border-radius:10px;
+      min-width:150px;
+      box-shadow:0 6px 20px rgba(12,34,78,0.04);
+    }
+    .stat .num{ font-size:18px; font-weight:700; }
+    .stat .label{ color:var(--muted); font-size:13px; margin-top:6px; }
+
+    /* responsive */
+    @media (max-width:900px){
+      .stats{ justify-content:space-between; }
+    }
+    @media (max-width:640px){
+      .page{ padding:12px; }
+      .header{ flex-direction:column; align-items:flex-start; gap:12px; }
+      .actions{ width:100%; justify-content:space-between; }
+    }
+
+    code{ background:#f3f7ff; padding:3px 6px; border-radius:6px; font-size:12px; }
+
+    /* small helper */
+    .section-title{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:8px; }
+    .section-title h2{ margin:0; font-size:16px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="header">
+      <div class="brand">
+        <div class="logo">CSV</div>
+        <div class="title">
+          <h1>CSV Summary Report</h1>
+          <p class="muted">A quick, human-friendly overview of your uploaded CSV</p>
+        </div>
+      </div>
+      <div class="actions">
+        <a href="/">Upload another file</a>
+        <a href="{{ download_csv }}" class="primary">Download summary CSV</a>
+        <a href="{{ download_corr }}">Download numeric correlation (CSV)</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Overall metrics</h2>
+      </div>
+      {{ overall_table|safe }}
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Missing values per column</h2>
+      </div>
+      {{ missing_table|safe }}
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Column types & unique counts</h2>
+      </div>
+      {{ dtype_table|safe }}
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Numeric descriptive statistics</h2>
+      </div>
+      {{ numeric_table|safe }}
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Categorical summary (top values)</h2>
+      </div>
+      {{ categorical_table|safe }}
+    </div>
+
+    {% if datetime_table %}
+    <div class="card">
+      <div class="section-title">
+        <h2>Datetime columns</h2>
+      </div>
+      {{ datetime_table|safe }}
+    </div>
+    {% endif %}
+
+    {% if corr_table %}
+    <div class="card">
+      <div class="section-title">
+        <h2>Correlation matrix (numeric columns)</h2>
+      </div>
+      {{ corr_table|safe }}
+    </div>
+    {% endif %}
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Sample data (first 5 rows)</h2>
+      </div>
+      {{ head_table|safe }}
+    </div>
+
+    <div class="card">
+      <div class="section-title">
+        <h2>Sample data (last 5 rows)</h2>
+      </div>
+      {{ tail_table|safe }}
+    </div>
+
+    <footer style="margin-top:18px; text-align:center; color:var(--muted); font-size:13px;">
+      Generated by CSV Summary Flask app — max upload 16 MB.
+    </footer>
+  </div>
+</body>
+</html>
+"""
+
+def safe_to_str(x):
+    # helper for CSV output
+    if pd.isna(x):
+        return ""
+    return str(x)
+
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(UPLOAD_FORM)
+
+@app.route('/upload', methods=['POST'])
+def upload_csv():
+    # Validate file part
+    if 'file' not in request.files:
+        return jsonify({'error': 'no file part in request'}), 400
+    file = request.files['file']
+    if file.filename == '':
+        return jsonify({'error': 'no selected file'}), 400
+
+    # Read CSV into pandas DataFrame
+    try:
+        # Try utf-8, fallback to latin1
+        raw = file.stream.read()
+        try:
+            s = raw.decode('utf-8')
+        except Exception:
+            s = raw.decode('latin1', errors='replace')
+        stream = io.StringIO(s)
+        # Let pandas infer better with low_memory=False
+        df = pd.read_csv(stream, low_memory=False)
+    except Exception as e:
+        return jsonify({'error': 'failed to read CSV', 'details': str(e)}), 400
+
+    # --- COMPUTE SUMMARY ---
+    total_rows = int(df.shape[0])
+    total_columns = int(df.shape[1])
+    duplicate_rows = int(df.duplicated().sum())
+    memory_usage_bytes = int(df.memory_usage(deep=True).sum())
+
+    # Missing
+    missing_counts = df.isnull().sum().astype(int)
+    missing_pct = (missing_counts / max(1, total_rows) * 100).round(2)
+
+    # Dtypes and unique
+    dtypes = df.dtypes.astype(str)
+    unique_counts = df.nunique(dropna=False)
+
+    # Numeric descriptive stats
+    numeric = df.select_dtypes(include=[np.number])
+    if not numeric.empty:
+        numeric_desc = numeric.describe(percentiles=[.25, .5, .75]).T
+        # add skew and kurtosis
+        numeric_desc['skew'] = numeric.skew().round(6)
+        numeric_desc['kurtosis'] = numeric.kurtosis().round(6)
+        numeric_desc = numeric_desc.reset_index().rename(columns={'index': 'column'})
+        numeric_desc = numeric_desc.rename(columns={
+            'count': 'count', 'mean': 'mean', 'std': 'std',
+            'min': 'min', '25%': '25%', '50%': '50%', '75%': '75%', 'max': 'max'
+        })
+    else:
+        numeric_desc = pd.DataFrame()
+
+    # Categorical summary: for object / category columns show top 5 values & counts
+    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    cat_summary_rows = []
+    for col in cat_cols:
+        top = df[col].value_counts(dropna=False).head(5)
+        for rank, (val, cnt) in enumerate(top.items(), start=1):
+            cat_summary_rows.append({
+                'column': col,
+                'rank': rank,
+                'value': safe_to_str(val),
+                'count': int(cnt),
+                'pct': round(cnt / max(1, total_rows) * 100, 2)
+            })
+    if cat_summary_rows:
+        cat_summary = pd.DataFrame(cat_summary_rows)
+    else:
+        cat_summary = pd.DataFrame()
+
+    # Datetime columns: min/max
+    datetime_cols = df.select_dtypes(include=['datetime', 'datetime64[ns]']).columns.tolist()
+    # Try to coerce object columns that look like dates
+    maybe_datetime = []
+    for col in df.select_dtypes(include=['object']).columns:
+        # Heuristic: many digits and - or /
+        sample = df[col].dropna().astype(str).head(10).tolist()
+        joined = " ".join(sample)
+        if any(c.isdigit() for c in joined) and ("/" in joined or "-" in joined or ":" in joined):
+            maybe_datetime.append(col)
+    # Try convert maybe_datetime safely
+    coerced_datetime_info = []
+    for col in maybe_datetime:
+        try:
+            parsed = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
+            if parsed.notna().sum() > 0:
+                datetime_cols.append(col)
+                coerced_datetime_info.append((col, parsed.min(), parsed.max(), parsed.nunique(dropna=True)))
+        except Exception:
+            pass
+
+    datetime_summary = []
+    for col in set(datetime_cols):
+        try:
+            parsed = pd.to_datetime(df[col], errors='coerce', infer_datetime_format=True)
+            datetime_summary.append({
+                'column': col,
+                'min': parsed.min(),
+                'max': parsed.max(),
+                'unique_values': int(parsed.nunique(dropna=True))
+            })
+        except Exception:
+            datetime_summary.append({
+                'column': col,
+                'min': None,
+                'max': None,
+                'unique_values': None
+            })
+    datetime_summary_df = pd.DataFrame(datetime_summary) if datetime_summary else pd.DataFrame()
+
+    # Correlations (numeric)
+    corr_df = None
+    if not numeric.empty and numeric.shape[1] > 1:
+        corr_df = numeric.corr(method='pearson').round(4)
+
+    # Head / tail
+    head_df = df.head(5)
+    tail_df = df.tail(5)
+
+    # Build "CSV summary" as fallback / downloadable: we'll create a human-friendly CSV with sections
+    csv_output = io.StringIO()
+    writer = csv.writer(csv_output)
+
+    # Overall metrics
+    writer.writerow(["Metric", "Value"])
+    writer.writerow(["Total Rows", total_rows])
+    writer.writerow(["Total Columns", total_columns])
+    writer.writerow(["Duplicate Rows", duplicate_rows])
+    writer.writerow(["Memory Usage (bytes)", memory_usage_bytes])
+    writer.writerow([])
+
+    # Missing per column
+    writer.writerow(["Column", "Missing Count", "Missing %", "Dtype", "Unique Values"])
+    for col in df.columns:
+        writer.writerow([col, int(missing_counts.get(col, 0)), missing_pct.get(col, 0.0), str(dtypes.get(col, "")), int(unique_counts.get(col, 0))])
+    writer.writerow([])
+
+    # Numeric summary CSV section
+    if not numeric_desc.empty:
+        writer.writerow(["--- Numeric Summary ---"])
+        writer.writerow(numeric_desc.columns.tolist())
+        for _, r in numeric_desc.iterrows():
+            row = [r.get(c, "") for c in numeric_desc.columns]
+            writer.writerow(row)
+        writer.writerow([])
+    else:
+        writer.writerow(["Note", "No numeric columns found"])
+        writer.writerow([])
+
+    # Categorical top values
+    if not cat_summary.empty:
+        writer.writerow(["Column", "Rank", "Value", "Count", "Percent"])
+        for _, r in cat_summary.iterrows():
+            writer.writerow([r['column'], r['rank'], r['value'], r['count'], r['pct']])
+        writer.writerow([])
+    else:
+        writer.writerow(["Note", "No categorical (object) columns found"])
+        writer.writerow([])
+
+    # Datetime summary
+    if not datetime_summary_df.empty:
+        writer.writerow(["Column", "Min", "Max", "Unique Values"])
+        for _, r in datetime_summary_df.iterrows():
+            writer.writerow([r['column'], safe_to_str(r['min']), safe_to_str(r['max']), r['unique_values']])
+        writer.writerow([])
+
+    # Head and tail
+    writer.writerow(["--- Sample: head (first 5 rows) ---"])
+    writer.writerow(head_df.columns.tolist())
+    for _, row in head_df.iterrows():
+        writer.writerow([safe_to_str(x) for x in row.tolist()])
+    writer.writerow([])
+
+    writer.writerow(["--- Sample: tail (last 5 rows) ---"])
+    writer.writerow(tail_df.columns.tolist())
+    for _, row in tail_df.iterrows():
+        writer.writerow([safe_to_str(x) for x in row.tolist()])
+
+    csv_output.seek(0)
+    csv_summary_str = csv_output.getvalue()
+
+    # If user wants CSV directly (curl or ?format=csv), return it
+    fmt = request.args.get('format', '').lower()
+    if fmt == 'csv':
+        return Response(
+            csv_summary_str,
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=summary_statistics.csv"}
+        )
+
+    # Otherwise produce HTML page with tables and download links.
+    # We create temporary files for CSV summary and corr CSV so links work via send_file
+    tmpdir = tempfile.mkdtemp(prefix="csv_summary_")
+    csv_path = os.path.join(tmpdir, "summary_statistics.csv")
+    with open(csv_path, "w", encoding="utf-8", newline="") as f:
+        f.write(csv_summary_str)
+
+    corr_path = None
+    if corr_df is not None:
+        corr_path = os.path.join(tmpdir, "correlation_matrix.csv")
+        corr_df.to_csv(corr_path, index=True)
+
+    # Render HTML tables using pandas.DataFrame.to_html (safe)
+    overall_df = pd.DataFrame([{
+        'Total Rows': total_rows,
+        'Total Columns': total_columns,
+        'Duplicate Rows': duplicate_rows,
+        'Memory Usage (bytes)': memory_usage_bytes
+    }])
+
+    missing_table = pd.DataFrame({
+        'missing_count': missing_counts,
+        'missing_pct': missing_pct
+    }).reset_index().rename(columns={'index': 'column'}).to_html(index=False, classes="table table-sm")
+
+    dtype_table = pd.DataFrame({
+        'column': df.columns,
+        'dtype': [str(dtypes[c]) for c in df.columns],
+        'unique_values': [int(unique_counts[c]) for c in df.columns]
+    })
+
+    numeric_table_html = numeric_desc.to_html(index=False, classes="table table-sm") if not numeric_desc.empty else "<p>No numeric columns.</p>"
+    categorical_table_html = cat_summary.to_html(index=False, classes="table table-sm") if not cat_summary.empty else "<p>No categorical columns.</p>"
+    datetime_table_html = datetime_summary_df.to_html(index=False, classes="table table-sm") if not datetime_summary_df.empty else ""
+    corr_table_html = corr_df.to_html(classes="table table-sm") if corr_df is not None else ""
+    head_html = head_df.to_html(index=False, classes="table table-sm")
+    tail_html = tail_df.to_html(index=False, classes="table table-sm")
+
+    # Build URLs for downloads that map to these temp files via send_file route
+    # We'll store the tmpdir path in a simple key by using its basename (unique due to mkdtemp),
+    # provide download endpoints below that send files from that dir.
+    key = os.path.basename(tmpdir)
+
+    # Save a small index file mapping key->tmpdir by creating a tiny file (simple approach)
+    # We'll encode the tmpdir path in a file inside tmpdir so send_file endpoints can find it
+    # (No persistent server storage used, cleaned up by OS over time / ephemeral)
+    meta_path = os.path.join(tmpdir, ".meta")
+    with open(meta_path, "w", encoding="utf-8") as mf:
+        mf.write(tmpdir)
+
+    download_csv_url = f"/download/{key}/summary_statistics.csv"
+    download_corr_url = f"/download/{key}/correlation_matrix.csv" if corr_path else "#"
+
+    rendered = render_template_string(
+        HTML_TEMPLATE,
+        overall_table=overall_df.to_html(index=False, classes="table table-sm"),
+        missing_table=missing_table,
+        dtype_table=dtype_table.to_html(index=False, classes="table table-sm"),
+        numeric_table=numeric_table_html,
+        categorical_table=categorical_table_html,
+        datetime_table=datetime_table_html,
+        corr_table=corr_table_html,
+        head_table=head_html,
+        tail_table=tail_html,
+        download_csv=download_csv_url,
+        download_corr=download_corr_url
+    )
+
+    return rendered
+
+@app.route('/download/<key>/<filename>', methods=['GET'])
+def download_temp_file(key, filename):
+    # Map key to tmpdir by assuming tmpdir name equals key (created above)
+    # We look in /tmp or system temp directory list for a folder that starts with key
+    temp_root = tempfile.gettempdir()
+    # try exact path
+    candidate = os.path.join(temp_root, key)
+    # but mkdtemp used system default; earlier tmpdir created by mkdtemp has full path; we saved meta inside it
+    # search through created tmp directories for one with basename == key
+    found = None
+    # walk temp_root only a little to find match
+    for entry in os.scandir(temp_root):
+        if entry.is_dir() and entry.name == key:
+            found = entry.path
+            break
+    # fallback: try cwd-based tmp (the one we created earlier by mkdtemp default)
+    if not found:
+        # check current working dir /tmp-like locations
+        possible = [os.path.join('/tmp', key), os.path.join(os.getcwd(), key)]
+        for p in possible:
+            if os.path.isdir(p):
+                found = p
+                break
+    if not found:
+        # Try to find any directory that starts with "csv_summary_" + key suffix
+        for entry in os.scandir(tempfile.gettempdir()):
+            if entry.is_dir() and entry.name.endswith(key):
+                found = entry.path
+                break
+    if not found:
+        return "File not found (expired or removed).", 404
+
+    file_path = os.path.join(found, filename)
+    if not os.path.isfile(file_path):
+        return "Requested file not found.", 404
+    return send_file(file_path, as_attachment=True)
+
+@app.errorhandler(413)
+def too_large(e):
+    return jsonify({'error': 'file too large'}), 413
+
+if __name__ == '__main__':
+    app.run(debug=True)
+S
